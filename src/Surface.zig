@@ -268,6 +268,7 @@ const DerivedConfig = struct {
     font: font.SharedGridSet.DerivedConfig,
     mouse_interval: u64,
     mouse_hide_while_typing: bool,
+    mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
     mouse_shift_capture: configpkg.MouseShiftCapture,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
@@ -341,6 +342,7 @@ const DerivedConfig = struct {
             .font = try font.SharedGridSet.DerivedConfig.init(alloc, config),
             .mouse_interval = config.@"click-repeat-interval" * 1_000_000, // 500ms
             .mouse_hide_while_typing = config.@"mouse-hide-while-typing",
+            .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
             .mouse_shift_capture = config.@"mouse-shift-capture",
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
@@ -702,7 +704,22 @@ pub fn init(
             .set_title,
             .{ .title = title },
         );
-    }
+    } else if (command) |cmd| switch (cmd) {
+        // If a user specifies a command it is appropriate to set the title as argv[0]
+        // we know in the case of a direct command it has been supplied by the user
+        .direct => |cmd_str| if (cmd_str.len != 0) {
+            _ = try rt_app.performAction(
+                .{ .surface = self },
+                .set_title,
+                .{ .title = cmd_str[0] },
+            );
+        },
+
+        // We won't set the title in the case the shell expands the command
+        // as that should typically be used to launch a shell which should
+        // set its own titles
+        .shell => {},
+    };
 
     // We are no longer the first surface
     app.first = false;
@@ -968,6 +985,8 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .renderer_health => |health| self.updateRendererHealth(health),
 
+        .scrollbar => |scrollbar| self.updateScrollbar(scrollbar),
+
         .report_color_scheme => |force| self.reportColorScheme(force),
 
         .present_surface => try self.presentSurface(),
@@ -1041,6 +1060,16 @@ fn selectionScrollTick(self: *Surface) !void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     const t: *terminal.Terminal = self.renderer_state.terminal;
+
+    // If our screen changed while this is happening, we stop our
+    // selection scroll.
+    if (self.mouse.left_click_screen != t.active_screen) {
+        self.io.queueMessage(
+            .{ .selection_scroll = false },
+            .locked,
+        );
+        return;
+    }
 
     // Scroll the viewport as required
     try t.scrollViewport(.{ .delta = delta });
@@ -1431,6 +1460,17 @@ fn updateRendererHealth(self: *Surface, health: rendererpkg.Health) void {
         health,
     ) catch |err| {
         log.warn("failed to notify app of renderer health change err={}", .{err});
+    };
+}
+
+/// Called when the scrollbar state changes.
+fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
+    _ = self.rt_app.performAction(
+        .{ .surface = self },
+        .scrollbar,
+        scrollbar,
+    ) catch |err| {
+        log.warn("failed to notify app of scrollbar change err={}", .{err});
     };
 }
 
@@ -1905,7 +1945,10 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
     // them to confirm the clipboard access. Each app runtime handles this
     // differently.
     const confirm = self.config.clipboard_write == .ask;
-    self.rt_surface.setClipboardString(buf, loc, confirm) catch |err| {
+    self.rt_surface.setClipboard(loc, &.{.{
+        .mime = "text/plain",
+        .data = buf,
+    }}, confirm) catch |err| {
         log.err("error setting clipboard string err={}", .{err});
         return;
     };
@@ -1915,19 +1958,101 @@ fn copySelectionToClipboards(
     self: *Surface,
     sel: terminal.Selection,
     clipboards: []const apprt.Clipboard,
-) void {
-    const buf = self.io.terminal.screen.selectionString(self.alloc, .{
-        .sel = sel,
-        .trim = self.config.clipboard_trim_trailing_spaces,
-    }) catch |err| {
-        log.err("error reading selection string err={}", .{err});
-        return;
-    };
-    defer self.alloc.free(buf);
+    format: input.Binding.Action.CopyToClipboard,
+) !void {
+    // Create an arena to simplify memory management here.
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
-    for (clipboards) |clipboard| self.rt_surface.setClipboardString(
-        buf,
+    // The options we'll use for all formatting. We'll just override the
+    // emit format.
+    const opts: terminal.formatter.Options = .{
+        .emit = .plain, // We'll override this below
+        .unwrap = true,
+        .trim = self.config.clipboard_trim_trailing_spaces,
+        .background = self.io.terminal.colors.background.get(),
+        .foreground = self.io.terminal.colors.foreground.get(),
+        .palette = &self.io.terminal.colors.palette.current,
+    };
+
+    const ScreenFormatter = terminal.formatter.ScreenFormatter;
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    var contents: std.ArrayList(apprt.ClipboardContent) = .empty;
+    switch (format) {
+        .plain => {
+            var formatter: ScreenFormatter = .init(&self.io.terminal.screen, opts);
+            formatter.content = .{ .selection = sel };
+            try formatter.format(&aw.writer);
+            try contents.append(alloc, .{
+                .mime = "text/plain",
+                .data = try aw.toOwnedSliceSentinel(0),
+            });
+        },
+
+        .vt => {
+            var formatter: ScreenFormatter = .init(&self.io.terminal.screen, opts: {
+                var copy = opts;
+                copy.emit = .vt;
+                break :opts copy;
+            });
+            formatter.content = .{ .selection = sel };
+            try formatter.format(&aw.writer);
+            try contents.append(alloc, .{
+                .mime = "text/plain",
+                .data = try aw.toOwnedSliceSentinel(0),
+            });
+        },
+
+        .html => {
+            var formatter: ScreenFormatter = .init(&self.io.terminal.screen, opts: {
+                var copy = opts;
+                copy.emit = .html;
+                break :opts copy;
+            });
+            formatter.content = .{ .selection = sel };
+            try formatter.format(&aw.writer);
+            try contents.append(alloc, .{
+                .mime = "text/html",
+                .data = try aw.toOwnedSliceSentinel(0),
+            });
+        },
+
+        .mixed => {
+            var formatter: ScreenFormatter = .init(&self.io.terminal.screen, opts);
+            formatter.content = .{ .selection = sel };
+            try formatter.format(&aw.writer);
+            try contents.append(alloc, .{
+                .mime = "text/plain",
+                .data = try aw.toOwnedSliceSentinel(0),
+            });
+
+            assert(aw.written().len == 0);
+            formatter = .init(&self.io.terminal.screen, opts: {
+                var copy = opts;
+                copy.emit = .html;
+
+                // We purposely don't emit background/foreground for mixed
+                // mode because the HTML contents is often used for rich text
+                // input and with trimmed spaces it looks pretty bad.
+                copy.background = null;
+                copy.foreground = null;
+
+                break :opts copy;
+            });
+            formatter.content = .{ .selection = sel };
+            try formatter.format(&aw.writer);
+            try contents.append(alloc, .{
+                .mime = "text/html",
+                .data = try aw.toOwnedSliceSentinel(0),
+            });
+        },
+    }
+
+    assert(contents.items.len > 0);
+    for (clipboards) |clipboard| self.rt_surface.setClipboard(
         clipboard,
+        contents.items,
         false,
     ) catch |err| {
         log.err(
@@ -1958,9 +2083,11 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
         .false => unreachable, // handled above with an early exit
 
         // Both standard and selection clipboards are set.
-        .clipboard => {
-            self.copySelectionToClipboards(sel, &.{ .standard, .selection });
-        },
+        .clipboard => try self.copySelectionToClipboards(
+            sel,
+            &.{ .standard, .selection },
+            .mixed,
+        ),
 
         // The selection clipboard is set if supported, otherwise the standard.
         .true => {
@@ -1968,7 +2095,11 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
                 .selection
             else
                 .standard;
-            self.copySelectionToClipboards(sel, &.{clipboard});
+            try self.copySelectionToClipboards(
+                sel,
+                &.{clipboard},
+                .mixed,
+            );
         },
     }
 }
@@ -2946,7 +3077,7 @@ pub fn scrollCallback(
         // If we have an active mouse reporting mode, clear the selection.
         // The selection can occur if the user uses the shift mod key to
         // override mouse grabbing from the window.
-        if (self.io.terminal.flags.mouse_event != .none) {
+        if (self.isMouseReporting()) {
             try self.setSelection(null);
         }
 
@@ -2989,7 +3120,7 @@ pub fn scrollCallback(
         // the normal logic.
 
         // If we're scrolling up or down, then send a mouse event.
-        if (self.io.terminal.flags.mouse_event != .none) {
+        if (self.isMouseReporting()) {
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 try self.mouseReport(switch (y.direction()) {
@@ -3062,6 +3193,13 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 /// The type of action to report for a mouse event.
 const MouseReportAction = enum { press, release, motion };
 
+/// Returns true if mouse reporting is enabled both in the config and
+/// the terminal state.
+fn isMouseReporting(self: *const Surface) bool {
+    return self.config.mouse_reporting and
+        self.io.terminal.flags.mouse_event != .none;
+}
+
 fn mouseReport(
     self: *Surface,
     button: ?input.MouseButton,
@@ -3069,9 +3207,13 @@ fn mouseReport(
     mods: input.Mods,
     pos: apprt.CursorPos,
 ) !void {
+    // Mouse reporting must be enabled by both config and terminal state
+    assert(self.config.mouse_reporting);
+    assert(self.io.terminal.flags.mouse_event != .none);
+
     // Depending on the event, we may do nothing at all.
     switch (self.io.terminal.flags.mouse_event) {
-        .none => return,
+        .none => unreachable, // checked by assert above
 
         // X10 only reports clicks with mouse button 1, 2, 3. We verify
         // the button later.
@@ -3466,7 +3608,7 @@ pub fn mouseButtonCallback(
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-        if (self.io.terminal.flags.mouse_event != .none) report: {
+        if (self.isMouseReporting()) report: {
             // If we have shift-pressed and we aren't allowed to capture it,
             // then we do not do a mouse report.
             if (mods.shift and !shift_capture) break :report;
@@ -3695,14 +3837,22 @@ pub fn mouseButtonCallback(
             },
             .copy => {
                 if (self.io.terminal.screen.selection) |sel| {
-                    self.copySelectionToClipboards(sel, &.{.standard});
+                    try self.copySelectionToClipboards(
+                        sel,
+                        &.{.standard},
+                        .mixed,
+                    );
                 }
 
                 try self.setSelection(null);
                 try self.queueRender();
             },
             .@"copy-or-paste" => if (self.io.terminal.screen.selection) |sel| {
-                self.copySelectionToClipboards(sel, &.{.standard});
+                try self.copySelectionToClipboards(
+                    sel,
+                    &.{.standard},
+                    .mixed,
+                );
                 try self.setSelection(null);
                 try self.queueRender();
             } else {
@@ -4104,7 +4254,7 @@ pub fn cursorPosCallback(
     }
 
     // Do a mouse report
-    if (self.io.terminal.flags.mouse_event != .none) report: {
+    if (self.isMouseReporting()) report: {
         // Shift overrides mouse "grabbing" in the window, taken from Kitty.
         // This only applies if there is a mouse button pressed so that
         // movement reports are not affected.
@@ -4136,6 +4286,12 @@ pub fn cursorPosCallback(
         // count because we don't want to handle selection.
         if (self.mouse.left_click_count == 0) break :select;
 
+        // If our terminal screen changed then we don't process this. We don't
+        // invalidate our pin or mouse state because if the screen switches
+        // back then we can continue our selection.
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        if (self.mouse.left_click_screen != t.active_screen) break :select;
+
         // All roads lead to requiring a re-render at this point.
         try self.queueRender();
 
@@ -4159,7 +4315,7 @@ pub fn cursorPosCallback(
         }
 
         // Convert to points
-        const screen = &self.renderer_state.terminal.screen;
+        const screen = &t.screen;
         const pin = screen.pages.pin(.{
             .viewport = .{
                 .x = pos_vp.x,
@@ -4600,23 +4756,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.terminal.fullReset();
         },
 
-        .copy_to_clipboard => {
+        .copy_to_clipboard => |format| {
             // We can read from the renderer state without holding
             // the lock because only we will write to this field.
             if (self.io.terminal.screen.selection) |sel| {
-                const buf = self.io.terminal.screen.selectionString(self.alloc, .{
-                    .sel = sel,
-                    .trim = self.config.clipboard_trim_trailing_spaces,
-                }) catch |err| {
-                    log.err("error reading selection string err={}", .{err});
-                    return true;
-                };
-                defer self.alloc.free(buf);
-
-                self.rt_surface.setClipboardString(buf, .standard, false) catch |err| {
-                    log.err("error setting clipboard string err={}", .{err});
-                    return true;
-                };
+                try self.copySelectionToClipboards(
+                    sel,
+                    &.{.standard},
+                    format,
+                );
 
                 // Clear the selection if configured to do so.
                 if (self.config.selection_clear_on_copy) {
@@ -4664,7 +4812,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 };
                 defer self.alloc.free(url_text);
 
-                self.rt_surface.setClipboardString(url_text, .standard, false) catch |err| {
+                self.rt_surface.setClipboard(.standard, &.{.{
+                    .mime = "text/plain",
+                    .data = url_text,
+                }}, false) catch |err| {
                     log.err("error copying url to clipboard err={}", .{err});
                     return false;
                 };
@@ -4679,7 +4830,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             const title = self.rt_surface.getTitle() orelse return false;
             if (title.len == 0) return false;
 
-            self.rt_surface.setClipboardString(title, .standard, false) catch |err| {
+            self.rt_surface.setClipboard(.standard, &.{.{
+                .mime = "text/plain",
+                .data = title,
+            }}, false) catch |err| {
                 log.err("error copying title to clipboard err={}", .{err});
                 return true;
             };
@@ -4783,12 +4937,27 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }, .unlocked);
         },
 
+        .scroll_to_row => |n| {
+            {
+                self.renderer_state.mutex.lock();
+                defer self.renderer_state.mutex.unlock();
+                const t: *terminal.Terminal = self.renderer_state.terminal;
+                t.screen.scroll(.{ .row = n });
+            }
+
+            try self.queueRender();
+        },
+
         .scroll_to_selection => {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
-            const sel = self.io.terminal.screen.selection orelse return false;
-            const tl = sel.topLeft(&self.io.terminal.screen);
-            self.io.terminal.screen.scroll(.{ .pin = tl });
+            {
+                self.renderer_state.mutex.lock();
+                defer self.renderer_state.mutex.unlock();
+                const sel = self.io.terminal.screen.selection orelse return false;
+                const tl = sel.topLeft(&self.io.terminal.screen);
+                self.io.terminal.screen.scroll(.{ .pin = tl });
+            }
+
+            try self.queueRender();
         },
 
         .scroll_page_up => {
@@ -4976,6 +5145,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .toggle,
         ),
 
+        .toggle_mouse_reporting => {
+            self.config.mouse_reporting = !self.config.mouse_reporting;
+            log.debug("mouse reporting toggled: {}", .{self.config.mouse_reporting});
+        },
+
         .toggle_command_palette => return try self.rt_app.performAction(
             .{ .surface = self },
             .toggle_command_palette,
@@ -5106,14 +5280,24 @@ const WriteScreenLoc = enum {
 fn writeScreenFile(
     self: *Surface,
     loc: WriteScreenLoc,
-    write_action: input.Binding.Action.WriteScreenAction,
+    write_screen: input.Binding.Action.WriteScreen,
 ) !void {
     // Create a temporary directory to store our scrollback.
     var tmp_dir = try internal_os.TempDir.init();
     errdefer tmp_dir.deinit();
 
     var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const filename = try std.fmt.bufPrint(&filename_buf, "{s}.txt", .{@tagName(loc)});
+    const filename = try std.fmt.bufPrint(
+        &filename_buf,
+        "{s}.{s}",
+        .{
+            @tagName(loc),
+            switch (write_screen.emit) {
+                .plain, .vt => "txt",
+                .html => "html",
+            },
+        },
+    );
 
     // Open our scrollback file
     var file = try tmp_dir.dir.createFile(
@@ -5173,18 +5357,24 @@ fn writeScreenFile(
             return;
         };
 
-        // Use topLeft and bottomRight to ensure correct coordinate ordering
-        const tl = sel.topLeft(&self.io.terminal.screen);
-        const br = sel.bottomRight(&self.io.terminal.screen);
-
-        try self.io.terminal.screen.dumpString(
-            buf_writer,
-            .{
-                .tl = tl,
-                .br = br,
-                .unwrap = true,
+        const ScreenFormatter = terminal.formatter.ScreenFormatter;
+        var formatter: ScreenFormatter = .init(&self.io.terminal.screen, .{
+            .emit = switch (write_screen.emit) {
+                .plain => .plain,
+                .vt => .vt,
+                .html => .html,
             },
-        );
+            .unwrap = true,
+            .trim = false,
+            .background = self.io.terminal.colors.background.get(),
+            .foreground = self.io.terminal.colors.foreground.get(),
+            .palette = &self.io.terminal.colors.palette.current,
+        });
+        formatter.content = .{ .selection = sel.ordered(
+            &self.io.terminal.screen,
+            .forward,
+        ) };
+        try formatter.format(buf_writer);
     }
     try buf_writer.flush();
 
@@ -5192,13 +5382,22 @@ fn writeScreenFile(
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try tmp_dir.dir.realpath(filename, &path_buf);
 
-    switch (write_action) {
+    switch (write_screen.action) {
         .copy => {
             const pathZ = try self.alloc.dupeZ(u8, path);
             defer self.alloc.free(pathZ);
-            try self.rt_surface.setClipboardString(pathZ, .standard, false);
+            try self.rt_surface.setClipboard(.standard, &.{.{
+                .mime = "text/plain",
+                .data = pathZ,
+            }}, false);
         },
-        .open => try self.openUrl(.{ .kind = .text, .url = path }),
+        .open => try self.openUrl(.{
+            .kind = switch (write_screen.emit) {
+                .plain, .vt => .text,
+                .html => .html,
+            },
+            .url = path,
+        }),
         .paste => self.io.queueMessage(try termio.Message.writeReq(
             self.alloc,
             path,
@@ -5236,11 +5435,10 @@ pub fn completeClipboardRequest(
             confirmed,
         ),
 
-        .osc_52_write => |clipboard| try self.rt_surface.setClipboardString(
-            data,
-            clipboard,
-            !confirmed,
-        ),
+        .osc_52_write => |clipboard| try self.rt_surface.setClipboard(clipboard, &.{.{
+            .mime = "text/plain",
+            .data = data,
+        }}, !confirmed),
     }
 }
 

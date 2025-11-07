@@ -164,6 +164,9 @@ pub const Action = union(Key) {
     /// The cell size has changed to the given dimensions in pixels.
     cell_size: CellSize,
 
+    /// The scrollbar is updating.
+    scrollbar: terminal.Scrollbar,
+
     /// The target should be re-rendered. This usually has a specific
     /// surface target but if the app is targeted then all active
     /// surfaces should be redrawn.
@@ -324,6 +327,7 @@ pub const Action = union(Key) {
         reset_window_size,
         initial_size,
         cell_size,
+        scrollbar,
         render,
         inspector,
         show_gtk_inspector,
@@ -720,6 +724,9 @@ pub const OpenUrl = struct {
         /// should try to open the URL in a text editor or viewer or
         /// some equivalent, if possible.
         text,
+
+        /// The URL is known to contain HTML content.
+        html,
     };
 
     // Sync with: ghostty_action_open_url_s

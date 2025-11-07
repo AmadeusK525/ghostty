@@ -45,6 +45,11 @@ typedef enum {
   GHOSTTY_CLIPBOARD_SELECTION,
 } ghostty_clipboard_e;
 
+typedef struct {
+  const char *mime;
+  const char *data;
+} ghostty_clipboard_content_s;
+
 typedef enum {
   GHOSTTY_CLIPBOARD_REQUEST_PASTE,
   GHOSTTY_CLIPBOARD_REQUEST_OSC_52_READ,
@@ -695,6 +700,7 @@ typedef struct {
 typedef enum {
   GHOSTTY_ACTION_OPEN_URL_KIND_UNKNOWN,
   GHOSTTY_ACTION_OPEN_URL_KIND_TEXT,
+  GHOSTTY_ACTION_OPEN_URL_KIND_HTML,
 } ghostty_action_open_url_kind_e;
 
 // apprt.action.OpenUrl.C
@@ -741,6 +747,13 @@ typedef struct {
   uint64_t duration;
 } ghostty_action_command_finished_s;
 
+// terminal.Scrollbar
+typedef struct {
+  uint64_t total;
+  uint64_t offset;
+  uint64_t len;
+} ghostty_action_scrollbar_s;
+
 // apprt.Action.Key
 typedef enum {
   GHOSTTY_ACTION_QUIT,
@@ -767,6 +780,7 @@ typedef enum {
   GHOSTTY_ACTION_RESET_WINDOW_SIZE,
   GHOSTTY_ACTION_INITIAL_SIZE,
   GHOSTTY_ACTION_CELL_SIZE,
+  GHOSTTY_ACTION_SCROLLBAR,
   GHOSTTY_ACTION_RENDER,
   GHOSTTY_ACTION_INSPECTOR,
   GHOSTTY_ACTION_SHOW_GTK_INSPECTOR,
@@ -809,6 +823,7 @@ typedef union {
   ghostty_action_size_limit_s size_limit;
   ghostty_action_initial_size_s initial_size;
   ghostty_action_cell_size_s cell_size;
+  ghostty_action_scrollbar_s scrollbar;
   ghostty_action_inspector_e inspector;
   ghostty_action_desktop_notification_s desktop_notification;
   ghostty_action_set_title_s set_title;
@@ -846,8 +861,9 @@ typedef void (*ghostty_runtime_confirm_read_clipboard_cb)(
     void*,
     ghostty_clipboard_request_e);
 typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
-                                                   const char*,
                                                    ghostty_clipboard_e,
+                                                   const ghostty_clipboard_content_s*,
+                                                   size_t,
                                                    bool);
 typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,

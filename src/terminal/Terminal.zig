@@ -22,6 +22,8 @@ const sgr = @import("sgr.zig");
 const Tabstops = @import("Tabstops.zig");
 const color = @import("color.zig");
 const mouse_shape_pkg = @import("mouse_shape.zig");
+const ReadonlyHandler = @import("stream_readonly.zig").Handler;
+const ReadonlyStream = @import("stream_readonly.zig").Stream;
 
 const size = @import("size.zig");
 const pagepkg = @import("page.zig");
@@ -71,17 +73,8 @@ scrolling_region: ScrollingRegion,
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
 
-/// The default color palette. This is only modified by changing the config file
-/// and is used to reset the palette when receiving an OSC 104 command.
-default_palette: color.Palette = color.default,
-
-/// The color palette to use. The mask indicates which palette indices have been
-/// modified with OSC 4
-color_palette: struct {
-    const Mask = std.StaticBitSet(@typeInfo(color.Palette).array.len);
-    colors: color.Palette = color.default,
-    mask: Mask = .initEmpty(),
-} = .{},
+/// The color state for this terminal.
+colors: Colors,
 
 /// The previous printed character. This is used for the repeat previous
 /// char CSI (ESC [ <n> b).
@@ -131,6 +124,23 @@ flags: packed struct {
     /// Dirty flags for the renderer.
     dirty: Dirty = .{},
 } = .{},
+
+/// The various color configurations a terminal maintains and that can
+/// be set dynamically via OSC, with defaults usually coming from a
+/// configuration.
+pub const Colors = struct {
+    background: color.DynamicRGB,
+    foreground: color.DynamicRGB,
+    cursor: color.DynamicRGB,
+    palette: color.DynamicPalette,
+
+    pub const default: Colors = .{
+        .background = .unset,
+        .foreground = .unset,
+        .cursor = .unset,
+        .palette = .default,
+    };
+};
 
 /// This is a set of dirty flags the renderer can use to determine
 /// what parts of the screen need to be redrawn. It is up to the renderer
@@ -197,6 +207,7 @@ pub const Options = struct {
     cols: size.CellCountInt,
     rows: size.CellCountInt,
     max_scrollback: usize = 10_000,
+    colors: Colors = .default,
 
     /// The default mode state. When the terminal gets a reset, it
     /// will revert back to this state.
@@ -210,7 +221,7 @@ pub fn init(
 ) !Terminal {
     const cols = opts.cols;
     const rows = opts.rows;
-    return Terminal{
+    return .{
         .cols = cols,
         .rows = rows,
         .active_screen = .primary,
@@ -224,6 +235,7 @@ pub fn init(
             .right = cols - 1,
         },
         .pwd = .empty,
+        .colors = opts.colors,
         .modes = .{
             .values = opts.default_modes,
             .default = opts.default_modes,
@@ -237,6 +249,19 @@ pub fn deinit(self: *Terminal, alloc: Allocator) void {
     self.secondary_screen.deinit();
     self.pwd.deinit(alloc);
     self.* = undefined;
+}
+
+/// Return a terminal.Stream that can process VT streams and update this
+/// terminal state. The streams will only process read-only data that
+/// modifies terminal state. Sequences that query or otherwise require
+/// output will be ignored.
+pub fn vtStream(self: *Terminal) ReadonlyStream {
+    return .initAlloc(self.gpa(), self.vtHandler());
+}
+
+/// This is the handler-side only for vtStream.
+pub fn vtHandler(self: *Terminal) ReadonlyHandler {
+    return .init(self);
 }
 
 /// The general allocator we should use for this terminal.
@@ -349,10 +374,20 @@ pub fn print(self: *Terminal, c: u21) !void {
             // the cell width accordingly. VS16 makes the character wide and
             // VS15 makes it narrow.
             if (c == 0xFE0F or c == 0xFE0E) {
-                // This only applies to emoji
+                // This check below isn't robust enough to be correct.
+                // But it is correct enough (the emoji check alone served us
+                // well through Ghostty 1.2.3!) and we can fix it up later.
+
+                // Emoji always allow VS15/16
                 const prev_props = unicode.table.get(prev.cell.content.codepoint);
                 const emoji = prev_props.grapheme_boundary_class.isExtendedPictographic();
-                if (!emoji) return;
+                if (!emoji) valid_check: {
+                    // If not an emoji, check if it is a defined variation
+                    // sequence in emoji-variation-sequences.txt
+                    if (c == 0xFE0F and prev_props.emoji_vs_emoji) break :valid_check;
+                    if (c == 0xFE0E and prev_props.emoji_vs_text) break :valid_check;
+                    return;
+                }
 
                 switch (c) {
                     0xFE0F => wide: {
@@ -581,7 +616,7 @@ fn printCell(
         if (unmapped_c > std.math.maxInt(u8)) break :c ' ';
 
         // Get our lookup table and map it
-        const table = set.table();
+        const table = charsets.table(set);
         break :c @intCast(table[@intCast(unmapped_c)]);
     };
 
@@ -3302,6 +3337,93 @@ test "Terminal: print multicodepoint grapheme, mode 2027" {
         try testing.expectEqual(@as(u21, 0), cell.content.codepoint);
         try testing.expect(!cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
+    }
+}
+
+test "Terminal: keypad sequence VS15" {
+    var t = try init(testing.allocator, .{ .cols = 80, .rows = 80 });
+    defer t.deinit(testing.allocator);
+
+    // Enable grapheme clustering
+    t.modes.set(.grapheme_cluster, true);
+
+    // This is: "#︎" (number sign with text presentation selector)
+    try t.print(0x23); // # Number sign (valid base)
+    try t.print(0xFE0E); // VS15 (text presentation selector)
+
+    // VS15 should combine with the base character into a single grapheme cluster,
+    // taking 1 cell (narrow character).
+    try testing.expectEqual(@as(usize, 0), t.screen.cursor.y);
+    try testing.expectEqual(@as(usize, 1), t.screen.cursor.x);
+
+    // Row should be dirty
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+
+    // The base emoji should be in cell 0 with the skin tone as a grapheme
+    {
+        const list_cell = t.screen.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0x23), cell.content.codepoint);
+        try testing.expect(cell.hasGrapheme());
+        try testing.expectEqual(Cell.Wide.narrow, cell.wide);
+    }
+}
+
+test "Terminal: keypad sequence VS16" {
+    var t = try init(testing.allocator, .{ .cols = 80, .rows = 80 });
+    defer t.deinit(testing.allocator);
+
+    // Enable grapheme clustering
+    t.modes.set(.grapheme_cluster, true);
+
+    // This is: "#️" (number sign with emoji presentation selector)
+    try t.print(0x23); // # Number sign (valid base)
+    try t.print(0xFE0F); // VS16 (emoji presentation selector)
+
+    // VS16 should combine with the base character into a single grapheme cluster,
+    // taking 2 cells (wide character).
+    try testing.expectEqual(@as(usize, 0), t.screen.cursor.y);
+    try testing.expectEqual(@as(usize, 2), t.screen.cursor.x);
+
+    // Row should be dirty
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+
+    // The base emoji should be in cell 0 with the skin tone as a grapheme
+    {
+        const list_cell = t.screen.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0x23), cell.content.codepoint);
+        try testing.expect(cell.hasGrapheme());
+        try testing.expectEqual(Cell.Wide.wide, cell.wide);
+    }
+}
+
+test "Terminal: Fitzpatrick skin tone next valid base" {
+    var t = try init(testing.allocator, .{ .cols = 80, .rows = 80 });
+    defer t.deinit(testing.allocator);
+
+    // Enable grapheme clustering
+    t.modes.set(.grapheme_cluster, true);
+
+    // This is: "👋🏿" (waving hand with dark skin tone)
+    try t.print(0x1F44B); // 👋 Waving hand (valid base)
+    try t.print(0x1F3FF); // 🏿 Dark skin tone modifier
+
+    // The skin tone should combine with the base emoji into a single grapheme cluster,
+    // taking 2 cells (wide character).
+    try testing.expectEqual(@as(usize, 0), t.screen.cursor.y);
+    try testing.expectEqual(@as(usize, 2), t.screen.cursor.x);
+
+    // Row should be dirty
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+
+    // The base emoji should be in cell 0 with the skin tone as a grapheme
+    {
+        const list_cell = t.screen.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+        const cell = list_cell.cell;
+        try testing.expectEqual(@as(u21, 0x1F44B), cell.content.codepoint);
+        try testing.expect(cell.hasGrapheme());
+        try testing.expectEqual(Cell.Wide.wide, cell.wide);
     }
 }
 

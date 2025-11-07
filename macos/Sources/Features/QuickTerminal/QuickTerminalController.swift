@@ -1,7 +1,7 @@
-import Foundation
 import Cocoa
-import SwiftUI
+import Foundation
 import GhosttyKit
+import SwiftUI
 
 /// Controller for the "quick" terminal.
 class QuickTerminalController: BaseTerminalController {
@@ -21,13 +21,8 @@ class QuickTerminalController: BaseTerminalController {
     // The active space when the quick terminal was last shown.
     private var previousActiveSpace: CGSSpace? = nil
 
-    /// The saved state when the quick terminal's surface tree becomes empty.
-    ///
-    /// This preserves the user's window size and position when all terminal surfaces
-    /// are closed (e.g., via the `exit` command). When a new surface is created,
-    /// the window will be restored to this frame, preventing SwiftUI from resetting
-    /// the window to its default minimum size.
-    private var lastClosedFrames: NSMapTable<NSScreen, LastClosedState>
+    /// Cache for per-screen window state.
+    private let screenStateCache = QuickTerminalScreenStateCache()
 
     /// Non-nil if we have hidden dock state.
     private var hiddenDock: HiddenDock? = nil
@@ -44,17 +39,14 @@ class QuickTerminalController: BaseTerminalController {
         return manager
     }()
 
-    init(_ ghostty: Ghostty.App,
-         position: QuickTerminalPosition = .top,
-         baseConfig base: Ghostty.SurfaceConfiguration? = nil,
-         surfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil
+    init(
+        _ ghostty: Ghostty.App,
+        position: QuickTerminalPosition = .top,
+        baseConfig base: Ghostty.SurfaceConfiguration? = nil,
+        surfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil
     ) {
         self.position = position
         self.derivedConfig = DerivedConfig(ghostty.config)
-        
-        // This is a weak to strong mapping, so that our keys being NSScreens
-        // can remove themselves when they disappear.
-        self.lastClosedFrames = .weakToStrongObjects()
 
         // Important detail here: we initialize with an empty surface tree so
         // that we don't start a terminal process. This gets started when the
@@ -148,13 +140,14 @@ class QuickTerminalController: BaseTerminalController {
         if let qtWindow = window as? QuickTerminalWindow {
             qtWindow.initialFrame = window.frame
         }
-        
-        window.contentView = NSHostingView(rootView: QuickTerminalView(
-            ghostty: self.ghostty,
-            controller: self,
-            tabManager: tabManager,
-        ))
-        
+
+        window.contentView = NSHostingView(
+            rootView: QuickTerminalView(
+                ghostty: self.ghostty,
+                controller: self,
+                tabManager: tabManager,
+            ))
+
         // Clear out our frame at this point, the fixup from above is complete.
         if let qtWindow = window as? QuickTerminalWindow {
             qtWindow.initialFrame = nil
@@ -238,15 +231,16 @@ class QuickTerminalController: BaseTerminalController {
 
     override func windowDidResize(_ notification: Notification) {
         guard let window = notification.object as? NSWindow,
-              window == self.window,
-              visible,
-              !isHandlingResize else { return }
+            window == self.window,
+            visible,
+            !isHandlingResize
+        else { return }
         guard let screen = window.screen ?? NSScreen.main else { return }
 
         // Prevent recursive loops
         isHandlingResize = true
         defer { isHandlingResize = false }
-        
+
         switch position {
         case .top, .bottom, .center:
             // For centered positions (top, bottom, center), we need to recenter the window
@@ -278,7 +272,9 @@ class QuickTerminalController: BaseTerminalController {
         animateIn()
     }
 
-    override func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
+    override func surfaceTreeDidChange(
+        from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>
+    ) {
         super.surfaceTreeDidChange(from: from, to: to)
 
         // If we have a tab with surfaces removed from surfaceTree, we need
@@ -333,7 +329,7 @@ class QuickTerminalController: BaseTerminalController {
     // MARK: Methods
 
     func toggle() {
-        if (visible) {
+        if visible {
             animateOut()
         } else {
             animateIn()
@@ -357,7 +353,7 @@ class QuickTerminalController: BaseTerminalController {
         // we want to store it so we can restore state later.
         if !NSApp.isActive {
             if let previousApp = NSWorkspace.shared.frontmostApplication,
-               previousApp.bundleIdentifier != Bundle.main.bundleIdentifier
+                previousApp.bundleIdentifier != Bundle.main.bundleIdentifier
             {
                 self.previousApp = previousApp
             }
@@ -370,7 +366,8 @@ class QuickTerminalController: BaseTerminalController {
         // tree can be empty if for example we run "exit" in the terminal and force
         // animate out.
         if surfaceTree.isEmpty,
-           let ghostty_app = ghostty.app {
+            let ghostty_app = ghostty.app
+        {
             let view = Ghostty.SurfaceView(ghostty_app, baseConfig: nil)
             surfaceTree = SplitTree(view: view)
             focusedSurface = view
@@ -398,18 +395,16 @@ class QuickTerminalController: BaseTerminalController {
 
     private func animateWindowIn(window: NSWindow, from position: QuickTerminalPosition) {
         guard let screen = derivedConfig.quickTerminalScreen.screen else { return }
-        
-        // Grab our last closed frame to use, and clear our state since we're animating in.
-        // We only use the last closed frame if we're opening on the same screen.
-        let lastClosedFrame: NSRect? = lastClosedFrames.object(forKey: screen)?.frame
-        lastClosedFrames.removeObject(forKey: screen)
+
+        // Grab our last closed frame to use from the cache.
+        let closedFrame = screenStateCache.frame(for: screen)
 
         // Move our window off screen to the initial animation position.
         position.setInitial(
             in: window,
             on: screen,
             terminalSize: derivedConfig.quickTerminalSize,
-            closedFrame: lastClosedFrame)
+            closedFrame: closedFrame)
 
         // We need to set our window level to a high value. In testing, only
         // popUpMenu and above do what we want. This gets it above the menu bar
@@ -424,7 +419,7 @@ class QuickTerminalController: BaseTerminalController {
         // If our dock position would conflict with our target location then
         // we autohide the dock.
         if position.conflictsWithDock(on: screen) {
-            if (hiddenDock == nil) {
+            if hiddenDock == nil {
                 hiddenDock = .init()
             }
 
@@ -437,58 +432,60 @@ class QuickTerminalController: BaseTerminalController {
 
         // Run the animation that moves our window into the proper place and makes
         // it visible.
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = derivedConfig.quickTerminalAnimationDuration
-            context.timingFunction = .init(name: .easeIn)
-            position.setFinal(
-                in: window.animator(),
-                on: screen,
-                terminalSize: derivedConfig.quickTerminalSize,
-                closedFrame: lastClosedFrame)
-        }, completionHandler: {
-            // There is a very minor delay here so waiting at least an event loop tick
-            // keeps us safe from the view not being on the window.
-            DispatchQueue.main.async {
-                // If we canceled our animation clean up some state.
-                guard self.visible else {
-                    self.hiddenDock = nil
-                    return
-                }
+        NSAnimationContext.runAnimationGroup(
+            { context in
+                context.duration = derivedConfig.quickTerminalAnimationDuration
+                context.timingFunction = .init(name: .easeIn)
+                position.setFinal(
+                    in: window.animator(),
+                    on: screen,
+                    terminalSize: derivedConfig.quickTerminalSize,
+                    closedFrame: closedFrame)
+            },
+            completionHandler: {
+                // There is a very minor delay here so waiting at least an event loop tick
+                // keeps us safe from the view not being on the window.
+                DispatchQueue.main.async {
+                    // If we canceled our animation clean up some state.
+                    guard self.visible else {
+                        self.hiddenDock = nil
+                        return
+                    }
 
-                // After animating in, we reset the window level to a value that
-                // is above other windows but not as high as popUpMenu. This allows
-                // things like IME dropdowns to appear properly.
-                window.level = .floating
+                    // After animating in, we reset the window level to a value that
+                    // is above other windows but not as high as popUpMenu. This allows
+                    // things like IME dropdowns to appear properly.
+                    window.level = .floating
 
-                // Now that the window is visible, sync our appearance. This function
-                // requires the window is visible.
-                self.syncAppearance()
+                    // Now that the window is visible, sync our appearance. This function
+                    // requires the window is visible.
+                    self.syncAppearance()
 
-                // Once our animation is done, we must grab focus since we can't grab
-                // focus of a non-visible window.
-                self.makeWindowKey(window)
+                    // Once our animation is done, we must grab focus since we can't grab
+                    // focus of a non-visible window.
+                    self.makeWindowKey(window)
 
-                // If our application is not active, then we grab focus. Its important
-                // we do this AFTER our window is animated in and focused because
-                // otherwise macOS will bring forward another window.
-                if !NSApp.isActive {
-                    NSApp.activate(ignoringOtherApps: true)
+                    // If our application is not active, then we grab focus. Its important
+                    // we do this AFTER our window is animated in and focused because
+                    // otherwise macOS will bring forward another window.
+                    if !NSApp.isActive {
+                        NSApp.activate(ignoringOtherApps: true)
 
-                    // This works around a really funky bug where if the terminal is
-                    // shown on a screen that has no other Ghostty windows, it takes
-                    // a few (variable) event loop ticks until we can actually focus it.
-                    // https://github.com/ghostty-org/ghostty/issues/2409
-                    //
-                    // We wait one event loop tick to try it because under the happy
-                    // path (we have windows on this screen) it takes one event loop
-                    // tick for window.isKeyWindow to return true.
-                    DispatchQueue.main.async {
-                        guard !window.isKeyWindow else { return }
-                        self.makeWindowKey(window, retries: 10)
+                        // This works around a really funky bug where if the terminal is
+                        // shown on a screen that has no other Ghostty windows, it takes
+                        // a few (variable) event loop ticks until we can actually focus it.
+                        // https://github.com/ghostty-org/ghostty/issues/2409
+                        //
+                        // We wait one event loop tick to try it because under the happy
+                        // path (we have windows on this screen) it takes one event loop
+                        // tick for window.isKeyWindow to return true.
+                        DispatchQueue.main.async {
+                            guard !window.isKeyWindow else { return }
+                            self.makeWindowKey(window, retries: 10)
+                        }
                     }
                 }
-            }
-        })
+            })
     }
 
     /// Attempt to make a window key, supporting retries if necessary. The retries will be attempted
@@ -533,7 +530,7 @@ class QuickTerminalController: BaseTerminalController {
         // terminal is reactivated with a new surface. Without this, SwiftUI
         // would reset the window to its minimum content size.
         if window.frame.width > 0 && window.frame.height > 0, let screen = window.screen {
-            lastClosedFrames.setObject(.init(frame: window.frame), forKey: screen)
+            screenStateCache.save(frame: window.frame, for: screen)
         }
 
         // If we hid the dock then we unhide it.
@@ -568,19 +565,21 @@ class QuickTerminalController: BaseTerminalController {
         // and lets us render off screen.
         window.level = .popUpMenu
 
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = derivedConfig.quickTerminalAnimationDuration
-            context.timingFunction = .init(name: .easeIn)
-            position.setInitial(
-                in: window.animator(),
-                on: screen,
-                terminalSize: derivedConfig.quickTerminalSize,
-                closedFrame: window.frame)
-        }, completionHandler: {
-            // This causes the window to be removed from the screen list and macOS
-            // handles what should be focused next.
-            window.orderOut(self)
-        })
+        NSAnimationContext.runAnimationGroup(
+            { context in
+                context.duration = derivedConfig.quickTerminalAnimationDuration
+                context.timingFunction = .init(name: .easeIn)
+                position.setInitial(
+                    in: window.animator(),
+                    on: screen,
+                    terminalSize: derivedConfig.quickTerminalSize,
+                    closedFrame: window.frame)
+            },
+            completionHandler: {
+                // This causes the window to be removed from the screen list and macOS
+                // handles what should be focused next.
+                window.orderOut(self)
+            })
     }
 
     private func syncAppearance() {
@@ -594,7 +593,7 @@ class QuickTerminalController: BaseTerminalController {
         guard window.isVisible else { return }
 
         // If we have window transparency then set it transparent. Otherwise set it opaque.
-        if (self.derivedConfig.backgroundOpacity < 1) {
+        if self.derivedConfig.backgroundOpacity < 1 {
             window.isOpaque = false
 
             // This is weird, but we don't use ".clear" because this creates a look that
@@ -602,13 +601,23 @@ class QuickTerminalController: BaseTerminalController {
             // Terminal.app more easily.
             window.backgroundColor = .white.withAlphaComponent(0.001)
 
-            ghostty_set_window_background_blur(ghostty.app, Unmanaged.passUnretained(window).toOpaque())
+            ghostty_set_window_background_blur(
+                ghostty.app, Unmanaged.passUnretained(window).toOpaque())
         } else {
             window.isOpaque = true
             window.backgroundColor = .windowBackgroundColor
         }
     }
 
+    private func showNoNewTabAlert() {
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Cannot Create New Tab"
+        alert.informativeText = "Tabs aren't supported in the Quick Terminal."
+        alert.addButton(withTitle: "OK")
+        alert.alertStyle = .warning
+        alert.beginSheetModal(for: window)
+    }
     // MARK: First Responder
 
     @IBAction override func closeWindow(_ sender: Any) {
@@ -649,10 +658,10 @@ class QuickTerminalController: BaseTerminalController {
         // We ignore the configured fullscreen style and always use non-native
         // because the way the quick terminal works doesn't support native.
         let mode: FullscreenMode
-        if (NSApp.isFrontmost) {
+        if NSApp.isFrontmost {
             // If we're frontmost and we have a notch then we keep padding
             // so all lines of the terminal are visible.
-            if (window?.screen?.hasNotch ?? false) {
+            if window?.screen?.hasNotch ?? false {
                 mode = .nonNativePaddedNotch
             } else {
                 mode = .nonNative
@@ -673,9 +682,11 @@ class QuickTerminalController: BaseTerminalController {
         guard notification.object == nil else { return }
 
         // Get our managed configuration object out
-        guard let config = notification.userInfo?[
-            Notification.Name.GhosttyConfigChangeKey
-        ] as? Ghostty.Config else { return }
+        guard
+            let config = notification.userInfo?[
+                Notification.Name.GhosttyConfigChangeKey
+            ] as? Ghostty.Config
+        else { return }
 
         // Update our derived config
         self.derivedConfig = DerivedConfig(config)
@@ -745,17 +756,10 @@ class QuickTerminalController: BaseTerminalController {
             hidden = false
         }
     }
-    
-    private class LastClosedState {
-        let frame: NSRect
-        
-        init(frame: NSRect) {
-            self.frame = frame
-        }
-    }
 }
 
 extension Notification.Name {
     /// The quick terminal did become hidden or visible.
-    static let quickTerminalDidChangeVisibility = Notification.Name("QuickTerminalDidChangeVisibility")
+    static let quickTerminalDidChangeVisibility = Notification.Name(
+        "QuickTerminalDidChangeVisibility")
 }

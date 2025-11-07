@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import UserNotifications
 import OSLog
 import Sparkle
@@ -98,8 +99,10 @@ class AppDelegate: NSObject,
     )
 
     /// Manages updates
-    let updaterController: SPUStandardUpdaterController
-    let updaterDelegate: UpdaterDelegate = UpdaterDelegate()
+    let updateController = UpdateController()
+    var updateViewModel: UpdateViewModel {
+        updateController.viewModel
+    }
 
     /// The elapsed time since the process was started
     var timeSinceLaunch: TimeInterval {
@@ -116,25 +119,9 @@ class AppDelegate: NSObject,
     private var signals: [DispatchSourceSignal] = []
 
     /// The custom app icon image that is currently in use.
-    @Published private(set) var appIcon: NSImage? = nil {
-        didSet {
-            NSApplication.shared.applicationIconImage = appIcon
-            let appPath = Bundle.main.bundlePath
-            NSWorkspace.shared.setIcon(appIcon, forFile: appPath, options: [])
-            NSWorkspace.shared.noteFileSystemChanged(appPath)
-        }
-    }
+    @Published private(set) var appIcon: NSImage? = nil
 
     override init() {
-        updaterController = SPUStandardUpdaterController(
-            // Important: we must not start the updater here because we need to read our configuration
-            // first to determine whether we're automatically checking, downloading, etc. The updater
-            // is started later in applicationDidFinishLaunching
-            startingUpdater: false,
-            updaterDelegate: updaterDelegate,
-            userDriverDelegate: nil
-        )
-
         super.init()
 
         ghostty.delegate = self
@@ -179,7 +166,7 @@ class AppDelegate: NSObject,
         ghosttyConfigDidChange(config: ghostty.config)
 
         // Start our update checker.
-        updaterController.startUpdater()
+        updateController.startUpdater()
 
         // Register our service provider. This must happen after everything is initialized.
         NSApp.servicesProvider = ServiceProvider()
@@ -323,6 +310,12 @@ class AppDelegate: NSObject,
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let windows = NSApplication.shared.windows
         if (windows.isEmpty) { return .terminateNow }
+        
+        // If we've already accepted to install an update, then we don't need to
+        // confirm quit. The user is already expecting the update to happen.
+        if updateController.isInstalling {
+            return .terminateNow
+        }
 
         // This probably isn't fully safe. The isEmpty check above is aspirational, it doesn't
         // quite work with SwiftUI because windows are retained on close. So instead we check
@@ -471,7 +464,12 @@ class AppDelegate: NSObject,
         }
         
         switch ghostty.config.macosDockDropBehavior {
-        case .new_tab: _ = TerminalController.newTab(ghostty, withBaseConfig: config)
+        case .new_tab:
+            _ = TerminalController.newTab(
+                ghostty,
+                from: TerminalController.preferredParent?.window,
+                withBaseConfig: config
+            )
         case .new_window: _ = TerminalController.newWindow(ghostty, withBaseConfig: config)
         }
         
@@ -714,6 +712,10 @@ class AppDelegate: NSObject,
     }
 
     @objc private func ghosttyBellDidRing(_ notification: Notification) {
+        if (ghostty.config.bellFeatures.contains(.system)) {
+            NSSound.beep()
+        }
+
         if (ghostty.config.bellFeatures.contains(.attention)) {
             // Bounce the dock icon if we're not focused.
             NSApp.requestUserAttention(.informationalRequest)
@@ -806,12 +808,12 @@ class AppDelegate: NSObject,
         // defined by our "auto-update" configuration (if set) or fall back to Sparkle
         // user-based defaults.
         if Bundle.main.infoDictionary?["SUEnableAutomaticChecks"] as? Bool == false {
-            updaterController.updater.automaticallyChecksForUpdates = false
-            updaterController.updater.automaticallyDownloadsUpdates = false
+            updateController.updater.automaticallyChecksForUpdates = false
+            updateController.updater.automaticallyDownloadsUpdates = false
         } else if let autoUpdate = config.autoUpdate {
-            updaterController.updater.automaticallyChecksForUpdates =
+            updateController.updater.automaticallyChecksForUpdates =
                 autoUpdate == .check || autoUpdate == .download
-            updaterController.updater.automaticallyDownloadsUpdates =
+            updateController.updater.automaticallyDownloadsUpdates =
                 autoUpdate == .download
         }
 
@@ -860,48 +862,53 @@ class AppDelegate: NSObject,
         } else {
             GlobalEventTap.shared.disable()
         }
+        Task {
+            await updateAppIcon(from: config)
+        }
     }
 
     /// Sync the appearance of our app with the theme specified in the config.
     private func syncAppearance(config: Ghostty.Config) {
         NSApplication.shared.appearance = .init(ghosttyConfig: config)
-        
+    }
+
+    @concurrent
+    private func updateAppIcon(from config: Ghostty.Config) async  {
+        var appIcon: NSImage?
+
         switch (config.macosIcon) {
         case .official:
-            self.appIcon = nil
             break
-
         case .blueprint:
-            self.appIcon = NSImage(named: "BlueprintImage")!
+            appIcon = NSImage(named: "BlueprintImage")!
 
         case .chalkboard:
-            self.appIcon = NSImage(named: "ChalkboardImage")!
+            appIcon = NSImage(named: "ChalkboardImage")!
 
         case .glass:
-            self.appIcon = NSImage(named: "GlassImage")!
+            appIcon = NSImage(named: "GlassImage")!
 
         case .holographic:
-            self.appIcon = NSImage(named: "HolographicImage")!
+            appIcon = NSImage(named: "HolographicImage")!
 
         case .microchip:
-            self.appIcon = NSImage(named: "MicrochipImage")!
+            appIcon = NSImage(named: "MicrochipImage")!
 
         case .paper:
-            self.appIcon = NSImage(named: "PaperImage")!
+            appIcon = NSImage(named: "PaperImage")!
 
         case .retro:
-            self.appIcon = NSImage(named: "RetroImage")!
+            appIcon = NSImage(named: "RetroImage")!
 
         case .xray:
-            self.appIcon = NSImage(named: "XrayImage")!
+            appIcon = NSImage(named: "XrayImage")!
 
         case .custom:
             if let userIcon = NSImage(contentsOfFile: config.macosCustomIcon) {
-                self.appIcon = userIcon
+                appIcon = userIcon
             } else {
-                self.appIcon = nil // Revert back to official icon if invalid location
+                appIcon = nil // Revert back to official icon if invalid location
             }
-
         case .customStyle:
             guard let ghostColor = config.macosIconGhostColor else { break }
             guard let screenColors = config.macosIconScreenColor else { break }
@@ -910,7 +917,26 @@ class AppDelegate: NSObject,
                 ghostColor: ghostColor,
                 frame: config.macosIconFrame
             ).makeImage() else { break }
-            self.appIcon = icon
+            appIcon = icon
+        }
+        // make it immutable, so Swift 6 won't complain
+        let newIcon = appIcon
+
+        let appPath = Bundle.main.bundlePath
+        NSWorkspace.shared.setIcon(newIcon, forFile: appPath, options: [])
+        NSWorkspace.shared.noteFileSystemChanged(appPath)
+
+        await MainActor.run {
+            self.appIcon = newIcon
+#if DEBUG
+            // if no custom icon specified, we use blueprint to distinguish from release app
+            NSApplication.shared.applicationIconImage = newIcon ?? NSImage(named: "BlueprintImage")
+            // Changing the app bundle's icon will corrupt code signing.
+            // We only use the default blueprint icon for the dock,
+            // so developers don't need to clean and re-build every time.
+#else
+            NSApplication.shared.applicationIconImage = newIcon
+#endif
         }
     }
 
@@ -1004,7 +1030,8 @@ class AppDelegate: NSObject,
     }
 
     @IBAction func checkForUpdates(_ sender: Any?) {
-        updaterController.checkForUpdates(sender)
+        updateController.checkForUpdates()
+        //UpdateSimulator.happyPath.simulate(with: updateViewModel)
     }
 
     @IBAction func newWindow(_ sender: Any?) {
@@ -1012,7 +1039,10 @@ class AppDelegate: NSObject,
     }
 
     @IBAction func newTab(_ sender: Any?) {
-        _ = TerminalController.newTab(ghostty)
+        _ = TerminalController.newTab(
+            ghostty,
+            from: TerminalController.preferredParent?.window
+        )
     }
 
     @IBAction func closeAllWindows(_ sender: Any?) {

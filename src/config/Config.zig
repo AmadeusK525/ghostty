@@ -24,6 +24,7 @@ const cli = @import("../cli.zig");
 
 const conditional = @import("conditional.zig");
 const Conditional = conditional.Conditional;
+const file_load = @import("file_load.zig");
 const formatterpkg = @import("formatter.zig");
 const themepkg = @import("theme.zig");
 const url = @import("url.zig");
@@ -412,16 +413,13 @@ pub const compatibility = std.StaticStringMap(
 @"adjust-box-thickness": ?MetricModifier = null,
 /// Height in pixels or percentage adjustment of maximum height for nerd font icons.
 ///
-/// Increasing this value will allow nerd font icons to be larger, but won't
-/// necessarily force them to be. Decreasing this value will make nerd font
-/// icons smaller.
+/// A positive (negative) value will increase (decrease) the maximum icon
+/// height. This may not affect all icons equally: the effect depends on whether
+/// the default size of the icon is height-constrained, which in turn depends on
+/// the aspect ratio of both the icon and your primary font.
 ///
-/// This value only applies to icons that are constrained to a single cell by
-/// neighboring characters. An icon that is free to spread across two cells
-/// can always use up to the full line height of the primary font.
-///
-/// The default value is 2/3 times the height of capital letters in your primary
-/// font plus 1/3 times the font's line height.
+/// Certain icons designed for box drawing and terminal graphics, such as
+/// Powerline symbols, are not affected by this option.
 ///
 /// See the notes about adjustments in `adjust-cell-width`.
 ///
@@ -477,6 +475,11 @@ pub const compatibility = std.StaticStringMap(
 ///     you're using a pixel font. Disabled by default.
 ///
 ///   * `autohint` - Enable the freetype auto-hinter. Enabled by default.
+///
+///   * `light` - Use a light hinting style, better preserving glyph shapes.
+///     This is the most common setting in GTK apps and therefore also Ghostty's
+///     default. This has no effect if `monochrome` is enabled. Enabled by
+///     default.
 ///
 /// Example: `hinting`, `no-hinting`, `force-autohint`, `no-force-autohint`
 @"freetype-load-flags": FreetypeLoadFlags = .{},
@@ -696,7 +699,8 @@ foreground: Color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
 /// Color palette for the 256 color form that many terminal applications use.
 /// The syntax of this configuration is `N=COLOR` where `N` is 0 to 255 (for
 /// the 256 colors in the terminal color table) and `COLOR` is a typical RGB
-/// color code such as `#AABBCC` or `AABBCC`, or a named X11 color.
+/// color code such as `#AABBCC` or `AABBCC`, or a named X11 color. For example,
+/// `palette = 5=#BB78D9` will set the 'purple' color.
 ///
 /// The palette index can be in decimal, binary, octal, or hexadecimal.
 /// Decimal is assumed unless a prefix is used: `0b` for binary, `0o` for octal,
@@ -835,6 +839,18 @@ palette: Palette = .{},
 ///   * `always`
 ///   * `never`
 @"mouse-shift-capture": MouseShiftCapture = .false,
+
+/// Enable or disable mouse reporting. When set to `false`, mouse events will
+/// not be reported to terminal applications even if they request it. This
+/// allows you to always use the mouse for selection and other terminal UI
+/// interactions without applications capturing mouse input.
+///
+/// When set to `true` (the default), terminal applications can request mouse
+/// reporting and will receive mouse events according to their requested mode.
+///
+/// This can be toggled at runtime using the `toggle_mouse_reporting` keybind
+/// action.
+@"mouse-reporting": bool = true,
 
 /// Multiplier for scrolling distance with the mouse wheel.
 ///
@@ -1198,6 +1214,24 @@ input: RepeatableReadableIO = .{},
 ///
 /// This can be changed at runtime but will only affect new terminal surfaces.
 @"scrollback-limit": usize = 10_000_000, // 10MB
+
+/// Control when the scrollbar is shown to scroll the scrollback buffer.
+///
+/// The default value is `system`.
+///
+/// Valid values:
+///
+///   * `system` - Respect the system settings for when to show scrollbars.
+///     For example, on macOS, this will respect the "Scrollbar behavior"
+///     system setting which by default usually only shows scrollbars while
+///     actively scrolling or hovering the gutter.
+///
+///   * `never` - Never show a scrollbar. You can still scroll using the mouse,
+///     keybind actions, etc. but you will not have a visual UI widget showing
+///     a scrollbar.
+///
+/// This only applies to macOS currently. GTK doesn't yet support scrollbars.
+scrollbar: Scrollbar = .system,
 
 /// Match a regular expression against the terminal text and associate clicking
 /// it with an action. This can be used to match URLs, file paths, etc. Actions
@@ -1732,7 +1766,7 @@ keybind: Keybinds = .{},
 ///   * `ghostty` - Use the background and foreground colors specified in the
 ///     Ghostty configuration. This is only supported on Linux builds.
 ///
-/// On macOS, if `macos-titlebar-style` is "tabs", the window theme will be
+/// On macOS, if `macos-titlebar-style` is `tabs` or `transparent`, the window theme will be
 /// automatically set based on the luminosity of the terminal background color.
 /// This only applies to terminal windows. This setting will still apply to
 /// non-terminal windows within Ghostty.
@@ -1973,7 +2007,9 @@ keybind: Keybinds = .{},
 @"clipboard-write": ClipboardAccess = .allow,
 
 /// Trims trailing whitespace on data that is copied to the clipboard. This does
-/// not affect data sent to the clipboard via `clipboard-write`.
+/// not affect data sent to the clipboard via `clipboard-write`. This only
+/// applies to trailing whitespace on lines that have other characters.
+/// Completely blank lines always have their whitespace trimmed.
 @"clipboard-trim-trailing-spaces": bool = true,
 
 /// Require confirmation before pasting text that appears unsafe. This helps
@@ -2074,7 +2110,7 @@ keybind: Keybinds = .{},
 
 /// When this is true, the default configuration file paths will be loaded.
 /// The default configuration file paths are currently only the XDG
-/// config path ($XDG_CONFIG_HOME/ghostty/config).
+/// config path ($XDG_CONFIG_HOME/ghostty/config.ghostty).
 ///
 /// If this is false, the default configuration paths will not be loaded.
 /// This is targeted directly at using Ghostty from the CLI in a way
@@ -2613,7 +2649,9 @@ keybind: Keybinds = .{},
 ///    This could result in an audiovisual effect, a notification, or something
 ///    else entirely. Changing these effects require altering system settings:
 ///    for instance under the "Sound > Alert Sound" setting in GNOME,
-///    or the "Accessibility > System Bell" settings in KDE Plasma. (GTK only)
+///    or the "Accessibility > System Bell" settings in KDE Plasma.
+///
+///    On macOS, this plays the system alert sound.
 ///
 ///  * `audio`
 ///
@@ -3400,7 +3438,7 @@ pub fn loadIter(
 /// `path` must be resolved and absolute.
 pub fn loadFile(self: *Config, alloc: Allocator, path: []const u8) !void {
     assert(std.fs.path.isAbsolute(path));
-    var file = openFile(path) catch |err| switch (err) {
+    var file = file_load.open(path) catch |err| switch (err) {
         error.NotAFile => {
             log.warn(
                 "config-file {s}: not reading because it is not a file",
@@ -3413,13 +3451,76 @@ pub fn loadFile(self: *Config, alloc: Allocator, path: []const u8) !void {
     };
     defer file.close();
 
+    try self.loadFsFile(alloc, &file, path);
+}
+
+/// Load config from the given File.
+fn loadFsFile(self: *Config, alloc: Allocator, file: *std.fs.File, path: []const u8) !void {
     std.log.info("reading configuration file path={s}", .{path});
     var buf: [2048]u8 = undefined;
     var file_reader = file.reader(&buf);
     const reader = &file_reader.interface;
+    try self.loadReader(alloc, reader, path);
+}
+
+/// Load config from the given Reader.
+fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []const u8) !void {
+    bom: {
+        // If the file starts with a UTF-8 byte order mark, skip it.
+        // https://en.wikipedia.org/wiki/Byte_order_mark#UTF-8
+        const bom: []const u8 = &.{ 0xef, 0xbb, 0xbf };
+        const str = reader.peek(bom.len) catch break :bom;
+        if (std.mem.eql(u8, str, bom)) {
+            log.info("skipping UTF-8 byte order mark", .{});
+            reader.toss(bom.len);
+        }
+    }
     var iter: cli.args.LineIterator = .{ .r = reader, .filepath = path };
     try self.loadIter(alloc, &iter);
     try self.expandPaths(std.fs.path.dirname(path).?);
+}
+
+test "handle bom in config files" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        const data = "\xef\xbb\xbfabnormal-command-exit-runtime = 2500\n";
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(
+            alloc,
+            &reader,
+            "/home/ghostty/.config/ghostty/config.ghostty",
+        );
+        try cfg.finalize();
+
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(
+            2500,
+            cfg.@"abnormal-command-exit-runtime",
+        );
+    }
+
+    {
+        const data = "abnormal-command-exit-runtime = 2500\n";
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(
+            alloc,
+            &reader,
+            "/home/ghostty/.config/ghostty/config.ghostty",
+        );
+        try cfg.finalize();
+
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(
+            2500,
+            cfg.@"abnormal-command-exit-runtime",
+        );
+    }
 }
 
 pub const OptionalFileAction = enum { loaded, not_found, @"error" };
@@ -3464,132 +3565,65 @@ fn writeConfigTemplate(path: []const u8) !void {
 }
 
 /// Load configurations from the default configuration files. The default
-/// configuration file is at `$XDG_CONFIG_HOME/ghostty/config`.
+/// configuration file is at `$XDG_CONFIG_HOME/ghostty/config.ghostty`.
 ///
-/// On macOS, `$HOME/Library/Application Support/$CFBundleIdentifier/config`
+/// On macOS, `$HOME/Library/Application Support/$CFBundleIdentifier/`
 /// is also loaded.
+///
+/// The legacy `config` file (without extension) is first loaded,
+/// then `config.ghostty`.
 pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
     // Load XDG first
-    const xdg_path = try defaultXdgPath(alloc);
+    const legacy_xdg_path = try file_load.legacyDefaultXdgPath(alloc);
+    defer alloc.free(legacy_xdg_path);
+    const xdg_path = try file_load.defaultXdgPath(alloc);
     defer alloc.free(xdg_path);
-    const xdg_action = self.loadOptionalFile(alloc, xdg_path);
+    const xdg_loaded: bool = xdg_loaded: {
+        const legacy_xdg_action = self.loadOptionalFile(alloc, legacy_xdg_path);
+        const xdg_action = self.loadOptionalFile(alloc, xdg_path);
+        if (xdg_action != .not_found and legacy_xdg_action != .not_found) {
+            log.warn("both config files `{s}` and `{s}` exist.", .{ legacy_xdg_path, xdg_path });
+            log.warn("loading them both in that order", .{});
+            break :xdg_loaded true;
+        }
+
+        break :xdg_loaded xdg_action != .not_found or
+            legacy_xdg_action != .not_found;
+    };
 
     // On macOS load the app support directory as well
     if (comptime builtin.os.tag == .macos) {
-        const app_support_path = try defaultAppSupportPath(alloc);
+        const legacy_app_support_path = try file_load.legacyDefaultAppSupportPath(alloc);
+        defer alloc.free(legacy_app_support_path);
+        const app_support_path = try file_load.preferredAppSupportPath(alloc);
         defer alloc.free(app_support_path);
-        const app_support_action = self.loadOptionalFile(alloc, app_support_path);
+        const app_support_loaded: bool = loaded: {
+            const legacy_app_support_action = self.loadOptionalFile(alloc, legacy_app_support_path);
+            const app_support_action = self.loadOptionalFile(alloc, app_support_path);
+            if (app_support_action != .not_found and legacy_app_support_action != .not_found) {
+                log.warn("both config files `{s}` and `{s}` exist.", .{ legacy_app_support_path, app_support_path });
+                log.warn("loading them both in that order", .{});
+                break :loaded true;
+            }
+
+            break :loaded app_support_action != .not_found or
+                legacy_app_support_action != .not_found;
+        };
 
         // If both files are not found, then we create a template file.
         // For macOS, we only create the template file in the app support
-        if (app_support_action == .not_found and xdg_action == .not_found) {
+        if (!app_support_loaded and !xdg_loaded) {
             writeConfigTemplate(app_support_path) catch |err| {
                 log.warn("error creating template config file err={}", .{err});
             };
         }
     } else {
-        if (xdg_action == .not_found) {
+        if (!xdg_loaded) {
             writeConfigTemplate(xdg_path) catch |err| {
                 log.warn("error creating template config file err={}", .{err});
             };
         }
     }
-}
-
-/// Default path for the XDG home configuration file. Returned value
-/// must be freed by the caller.
-fn defaultXdgPath(alloc: Allocator) ![]const u8 {
-    return try internal_os.xdg.config(
-        alloc,
-        .{ .subdir = "ghostty/config" },
-    );
-}
-
-/// Default path for the macOS Application Support configuration file.
-/// Returned value must be freed by the caller.
-fn defaultAppSupportPath(alloc: Allocator) ![]const u8 {
-    return try internal_os.macos.appSupportDir(alloc, "config");
-}
-
-/// Returns the path to the preferred default configuration file.
-/// This is the file where users should place their configuration.
-///
-/// This doesn't create or populate the file with any default
-/// contents; downstream callers must handle this.
-///
-/// The returned value must be freed by the caller.
-pub fn preferredDefaultFilePath(alloc: Allocator) ![]const u8 {
-    switch (builtin.os.tag) {
-        .macos => {
-            // macOS prefers the Application Support directory
-            // if it exists.
-            const app_support_path = try defaultAppSupportPath(alloc);
-            if (openFile(app_support_path)) |f| {
-                f.close();
-                return app_support_path;
-            } else |_| {}
-
-            // Try the XDG path if it exists
-            const xdg_path = try defaultXdgPath(alloc);
-            if (openFile(xdg_path)) |f| {
-                f.close();
-                alloc.free(app_support_path);
-                return xdg_path;
-            } else |_| {}
-            defer alloc.free(xdg_path);
-
-            // Neither exist, use app support
-            return app_support_path;
-        },
-
-        // All other platforms use XDG only
-        else => return try defaultXdgPath(alloc),
-    }
-}
-
-const OpenFileError = error{
-    FileNotFound,
-    FileIsEmpty,
-    FileOpenFailed,
-    NotAFile,
-};
-
-/// Opens the file at the given path and returns the file handle
-/// if it exists and is non-empty. This also constrains the possible
-/// errors to a smaller set that we can explicitly handle.
-fn openFile(path: []const u8) OpenFileError!std.fs.File {
-    assert(std.fs.path.isAbsolute(path));
-
-    var file = std.fs.openFileAbsolute(
-        path,
-        .{},
-    ) catch |err| switch (err) {
-        error.FileNotFound => return OpenFileError.FileNotFound,
-        else => {
-            log.warn("unexpected file open error path={s} err={}", .{
-                path,
-                err,
-            });
-            return OpenFileError.FileOpenFailed;
-        },
-    };
-    errdefer file.close();
-
-    const stat = file.stat() catch |err| {
-        log.warn("error getting file stat path={s} err={}", .{
-            path,
-            err,
-        });
-        return OpenFileError.FileOpenFailed;
-    };
-    switch (stat.kind) {
-        .file => {},
-        else => return OpenFileError.NotAFile,
-    }
-
-    if (stat.size == 0) return OpenFileError.FileIsEmpty;
-
-    return file;
 }
 
 /// Load and parse the CLI args.
@@ -3793,13 +3827,7 @@ pub fn loadRecursiveFiles(self: *Config, alloc_gpa: Allocator) !void {
             },
         }
 
-        log.info("loading config-file path={s}", .{path});
-        var buf: [2048]u8 = undefined;
-        var file_reader = file.reader(&buf);
-        const reader = &file_reader.interface;
-        var iter: cli.args.LineIterator = .{ .r = reader, .filepath = path };
-        try self.loadIter(alloc_gpa, &iter);
-        try self.expandPaths(std.fs.path.dirname(path).?);
+        try self.loadFsFile(arena_alloc, &file, path);
     }
 
     // If we have a suffix, add that back.
@@ -4178,7 +4206,7 @@ pub fn finalize(self: *Config) !void {
     // Clamp our contrast
     self.@"minimum-contrast" = @min(21, @max(1, self.@"minimum-contrast"));
 
-    // Minimmum window size
+    // Minimum window size
     if (self.@"window-width" > 0) self.@"window-width" = @max(10, self.@"window-width");
     if (self.@"window-height" > 0) self.@"window-height" = @max(4, self.@"window-height");
 
@@ -4990,6 +5018,13 @@ pub const TerminalColor = union(enum) {
         return .{ .color = try Color.parseCLI(input) };
     }
 
+    pub fn toTerminalRGB(self: TerminalColor) ?terminal.color.RGB {
+        return switch (self) {
+            .color => |v| v.toTerminalRGB(),
+            .@"cell-foreground", .@"cell-background" => null,
+        };
+    }
+
     /// Used by Formatter
     pub fn formatEntry(self: TerminalColor, formatter: formatterpkg.EntryFormatter) !void {
         switch (self) {
@@ -5674,12 +5709,12 @@ pub const Keybinds = struct {
             try self.set.put(
                 alloc,
                 .{ .key = .{ .physical = .copy } },
-                .{ .copy_to_clipboard = {} },
+                .{ .copy_to_clipboard = .mixed },
             );
             try self.set.put(
                 alloc,
                 .{ .key = .{ .physical = .paste } },
-                .{ .paste_from_clipboard = {} },
+                .paste_from_clipboard,
             );
 
             // On non-MacOS desktop envs (Windows, KDE, Gnome, Xfce), ctrl+insert is an
@@ -5692,7 +5727,7 @@ pub const Keybinds = struct {
                 try self.set.put(
                     alloc,
                     .{ .key = .{ .physical = .insert }, .mods = .{ .ctrl = true } },
-                    .{ .copy_to_clipboard = {} },
+                    .{ .copy_to_clipboard = .mixed },
                 );
                 try self.set.put(
                     alloc,
@@ -5711,7 +5746,7 @@ pub const Keybinds = struct {
             try self.set.putFlags(
                 alloc,
                 .{ .key = .{ .unicode = 'c' }, .mods = mods },
-                .{ .copy_to_clipboard = {} },
+                .{ .copy_to_clipboard = .mixed },
                 .{ .performable = true },
             );
             try self.set.put(
@@ -7937,11 +7972,15 @@ pub const BackgroundImageFit = enum {
 pub const FreetypeLoadFlags = packed struct {
     // The defaults here at the time of writing this match the defaults
     // for Freetype itself. Ghostty hasn't made any opinionated changes
-    // to these defaults.
+    // to these defaults. (Strictly speaking, `light` isn't FreeType's
+    // own default, but appears to be the effective default with most
+    // Fontconfig-aware software using FreeType, so until Ghostty
+    // implements Fontconfig support we default to `light`.)
     hinting: bool = true,
     @"force-autohint": bool = false,
     monochrome: bool = false,
     autohint: bool = true,
+    light: bool = true,
 };
 
 /// See linux-cgroup
@@ -8446,6 +8485,12 @@ pub const WindowPadding = struct {
         try testing.expectError(error.InvalidValue, WindowPadding.parseCLI(""));
         try testing.expectError(error.InvalidValue, WindowPadding.parseCLI("a"));
     }
+};
+
+/// See scrollbar
+pub const Scrollbar = enum {
+    system,
+    never,
 };
 
 /// See scroll-to-bottom
