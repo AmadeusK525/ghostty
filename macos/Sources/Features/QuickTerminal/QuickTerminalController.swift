@@ -321,6 +321,12 @@ class QuickTerminalController: BaseTerminalController {
             return
         }
 
+        // If we still have tabs, we close the current one.
+        if tabManager.tabs.count > 1 {
+            tabManager.closeTab(tabManager.currentTab!)
+            return
+        }
+
         // If its the root then we just animate out. We never actually allow
         // the surface to fully close.
         animateOut()
@@ -620,8 +626,7 @@ class QuickTerminalController: BaseTerminalController {
     }
     // MARK: First Responder
 
-    @IBAction override func closeWindow(_ sender: Any) {
-        // Instead of closing the window, we animate it out.
+    @IBAction override func closeWindow(_ sender: Any?) {
         animateOut()
     }
 
