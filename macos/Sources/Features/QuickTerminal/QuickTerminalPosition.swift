@@ -186,46 +186,52 @@ enum QuickTerminalPosition : String {
 }
 
 extension QuickTerminalPosition {
-    private var savedFrameKey: String { "QuickTerminalSavedFrame_\(rawValue)" }
+    private var savedDeltaXKey: String { "QuickTerminalDeltaX_\(rawValue)" }
+    private var savedDeltaYKey: String { "QuickTerminalDeltaY_\(rawValue)" }
+    private var savedWidthKey: String { "QuickTerminalSavedWidth_\(rawValue)" }
+    private var savedHeightKey: String { "QuickTerminalSavedHeight_\(rawValue)" }
     
     func saveCurrentFrame(_ window: NSWindow) {
-        var frame = window.frame
-        let data = Data(bytes: &frame, count: MemoryLayout<NSRect>.size)
-        UserDefaults.standard.set(data, forKey: savedFrameKey)
+        guard let screen = window.screen else { return }
+        let defaultOrigin = finalOrigin(for: window, on: screen)
+        let deltaX = window.frame.origin.x - defaultOrigin.x
+        let deltaY = window.frame.origin.y - defaultOrigin.y
+        UserDefaults.standard.set(deltaX, forKey: savedDeltaXKey)
+        UserDefaults.standard.set(deltaY, forKey: savedDeltaYKey)
+        UserDefaults.standard.set(window.frame.size.width, forKey: savedWidthKey)
+        UserDefaults.standard.set(window.frame.size.height, forKey: savedHeightKey)
     }
     
-    private func loadSavedFrame(on screen: NSScreen) -> NSRect? {
-        guard let data = UserDefaults.standard.data(forKey: savedFrameKey),
-              data.count == MemoryLayout<NSRect>.size else { return nil }
-        
-        let saved = data.withUnsafeBytes { $0.load(as: NSRect.self) }
-        
-        // Simple safety: if saved rect is completely off-screen → ignore
-        if screen.visibleFrame.intersection(saved).isEmpty {
-            return nil
-        }
-        return saved
+    private func loadSaved(on screen: NSScreen) -> (deltaX: CGFloat, deltaY: CGFloat, size: NSSize)? {
+        guard let dx = UserDefaults.standard.object(forKey: savedDeltaXKey) as? CGFloat,
+              let dy = UserDefaults.standard.object(forKey: savedDeltaYKey) as? CGFloat,
+              let w = UserDefaults.standard.object(forKey: savedWidthKey) as? CGFloat,
+              let h = UserDefaults.standard.object(forKey: savedHeightKey) as? CGFloat else { return nil }
+        return (dx, dy, NSSize(width: w, height: h))
+    }
+    
+    func hasCustomDelta() -> Bool {
+        guard let dx = UserDefaults.standard.object(forKey: savedDeltaXKey) as? CGFloat,
+              let dy = UserDefaults.standard.object(forKey: savedDeltaYKey) as? CGFloat else { return false }
+        return dx != 0 || dy != 0
     }
     
     func setInitialPatched(in window: NSWindow, on screen: NSScreen, terminalSize: QuickTerminalSize) {
         window.alphaValue = 0
-        if let saved = loadSavedFrame(on: screen) {
-            window.setFrame(saved, display: false)
-        } else {
-            let size = configuredFrameSize(on: screen, terminalSize: terminalSize)
-            let origin = initialOrigin(for: window, on: screen)
-            window.setFrame(NSRect(origin: origin, size: size), display: false)
-        }
+        let saved = loadSaved(on: screen)
+        let useSize = saved?.size ?? configuredFrameSize(on: screen, terminalSize: terminalSize)
+        window.setFrame(NSRect(origin: window.frame.origin, size: useSize), display: false) // Temp size for calc
+        let origin = initialOrigin(for: window, on: screen)
+        window.setFrame(NSRect(origin: origin, size: useSize), display: false)
     }
     
     func setFinalPatched(in window: NSWindow, on screen: NSScreen, terminalSize: QuickTerminalSize) {
         window.alphaValue = 1
-        if let saved = loadSavedFrame(on: screen) {
-            window.setFrame(saved, display: true)
-        } else {
-            let size = configuredFrameSize(on: screen, terminalSize: terminalSize)
-            let origin = finalOrigin(for: window, on: screen)
-            window.setFrame(NSRect(origin: origin, size: size), display: true)
-        }
+        let saved = loadSaved(on: screen)
+        let useSize = saved?.size ?? configuredFrameSize(on: screen, terminalSize: terminalSize)
+        window.setFrame(NSRect(origin: window.frame.origin, size: useSize), display: false) // Temp size
+        let defaultOrigin = finalOrigin(for: window, on: screen)
+        let origin = saved != nil ? CGPoint(x: defaultOrigin.x + saved!.deltaX, y: defaultOrigin.y + saved!.deltaY) : defaultOrigin
+        window.setFrame(NSRect(origin: origin, size: useSize), display: true)
     }
 }
