@@ -184,3 +184,48 @@ enum QuickTerminalPosition : String {
         }
     }
 }
+
+extension QuickTerminalPosition {
+    private var savedFrameKey: String { "QuickTerminalSavedFrame_\(rawValue)" }
+    
+    func saveCurrentFrame(_ window: NSWindow) {
+        var frame = window.frame
+        let data = Data(bytes: &frame, count: MemoryLayout<NSRect>.size)
+        UserDefaults.standard.set(data, forKey: savedFrameKey)
+    }
+    
+    private func loadSavedFrame(on screen: NSScreen) -> NSRect? {
+        guard let data = UserDefaults.standard.data(forKey: savedFrameKey),
+              data.count == MemoryLayout<NSRect>.size else { return nil }
+        
+        let saved = data.withUnsafeBytes { $0.load(as: NSRect.self) }
+        
+        // Simple safety: if saved rect is completely off-screen → ignore
+        if screen.visibleFrame.intersection(saved).isEmpty {
+            return nil
+        }
+        return saved
+    }
+    
+    func setInitialPatched(in window: NSWindow, on screen: NSScreen, terminalSize: QuickTerminalSize) {
+        window.alphaValue = 0
+        if let saved = loadSavedFrame(on: screen) {
+            window.setFrame(saved, display: false)
+        } else {
+            let size = configuredFrameSize(on: screen, terminalSize: terminalSize)
+            let origin = initialOrigin(for: window, on: screen)
+            window.setFrame(NSRect(origin: origin, size: size), display: false)
+        }
+    }
+    
+    func setFinalPatched(in window: NSWindow, on screen: NSScreen, terminalSize: QuickTerminalSize) {
+        window.alphaValue = 1
+        if let saved = loadSavedFrame(on: screen) {
+            window.setFrame(saved, display: true)
+        } else {
+            let size = configuredFrameSize(on: screen, terminalSize: terminalSize)
+            let origin = finalOrigin(for: window, on: screen)
+            window.setFrame(NSRect(origin: origin, size: size), display: true)
+        }
+    }
+}

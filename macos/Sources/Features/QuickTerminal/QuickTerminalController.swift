@@ -442,11 +442,10 @@ class QuickTerminalController: BaseTerminalController {
             { context in
                 context.duration = derivedConfig.quickTerminalAnimationDuration
                 context.timingFunction = .init(name: .easeIn)
-                position.setFinal(
+                position.setFinalPatched(
                     in: window.animator(),
                     on: screen,
-                    terminalSize: derivedConfig.quickTerminalSize,
-                    closedFrame: closedFrame)
+                    terminalSize: derivedConfig.quickTerminalSize)
             },
             completionHandler: {
                 // There is a very minor delay here so waiting at least an event loop tick
@@ -541,6 +540,8 @@ class QuickTerminalController: BaseTerminalController {
 
         // If we hid the dock then we unhide it.
         hiddenDock = nil
+        
+        position.saveCurrentFrame(window)
 
         // If the window isn't on our active space then we don't animate, we just
         // hide it.
@@ -575,11 +576,10 @@ class QuickTerminalController: BaseTerminalController {
             { context in
                 context.duration = derivedConfig.quickTerminalAnimationDuration
                 context.timingFunction = .init(name: .easeIn)
-                position.setInitial(
+                position.setInitialPatched(
                     in: window.animator(),
                     on: screen,
-                    terminalSize: derivedConfig.quickTerminalSize,
-                    closedFrame: window.frame)
+                    terminalSize: derivedConfig.quickTerminalSize)
             },
             completionHandler: {
                 // This causes the window to be removed from the screen list and macOS
