@@ -460,7 +460,8 @@ class QuickTerminalController: BaseTerminalController {
                     // After animating in, we reset the window level to a value that
                     // is above other windows but not as high as popUpMenu. This allows
                     // things like IME dropdowns to appear properly.
-                    window.level = .floating
+                    // Don’t lower window level in fullscreen
+                    window.level = (self.fullscreenStyle?.isFullscreen == true) ? .normal : .floating
 
                     // Now that the window is visible, sync our appearance. This function
                     // requires the window is visible.
@@ -526,9 +527,9 @@ class QuickTerminalController: BaseTerminalController {
     private func animateWindowOut(window: NSWindow, to position: QuickTerminalPosition) {
         // If we are in fullscreen, then we exit fullscreen. We do this immediately so
         // we have th correct window.frame for the save state below.
-        if let fullscreenStyle, fullscreenStyle.isFullscreen {
-            fullscreenStyle.exit()
-        }
+        // if let fullscreenStyle, fullscreenStyle.isFullscreen {
+        //     fullscreenStyle.exit()
+        // }
 
         // Save the current window frame before animating out. This preserves
         // the user's preferred window size and position for when the quick
@@ -584,7 +585,10 @@ class QuickTerminalController: BaseTerminalController {
             completionHandler: {
                 // This causes the window to be removed from the screen list and macOS
                 // handles what should be focused next.
-                window.orderOut(self)
+                // Only orderOut if NOT in fullscreen — fullscreen windows must stay on-screen
+                if self.fullscreenStyle?.isFullscreen != true {
+                    window.orderOut(self)
+                }
             })
     }
 
